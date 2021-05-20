@@ -4,16 +4,16 @@ package core
 import (
 	"fmt"
 	"io/ioutil"
-	"os"
 	"reflect"
 
+	"github.com/mattn/anko/env"
 	"github.com/mattn/anko/parser"
 	"github.com/mattn/anko/vm"
 )
 
 // Import defines core language builtins - keys, range, println,  etc.
-func Import(env *vm.Env) *vm.Env {
-	env.Define("keys", func(v interface{}) []interface{} {
+func Import(e *env.Env) *env.Env {
+	e.Define("keys", func(v interface{}) []interface{} {
 		rv := reflect.ValueOf(v)
 		if rv.Kind() == reflect.Interface {
 			rv = rv.Elem()
@@ -26,7 +26,7 @@ func Import(env *vm.Env) *vm.Env {
 		return mapKeys
 	})
 
-	env.Define("range", func(args ...int64) []int64 {
+	e.Define("range", func(args ...int64) []int64 {
 		var start, stop int64
 		var step int64 = 1
 
@@ -56,11 +56,11 @@ func Import(env *vm.Env) *vm.Env {
 		return arr
 	})
 
-	env.Define("typeOf", func(v interface{}) string {
+	e.Define("typeOf", func(v interface{}) string {
 		return reflect.TypeOf(v).String()
 	})
 
-	env.Define("kindOf", func(v interface{}) string {
+	e.Define("kindOf", func(v interface{}) string {
 		typeOf := reflect.TypeOf(v)
 		if typeOf == nil {
 			return "nil"
@@ -68,16 +68,12 @@ func Import(env *vm.Env) *vm.Env {
 		return typeOf.Kind().String()
 	})
 
-	env.Define("chanOf", func(t reflect.Type) reflect.Value {
-		return reflect.MakeChan(t, 1)
-	})
-
-	env.Define("defined", func(s string) bool {
-		_, err := env.Get(s)
+	e.Define("defined", func(s string) bool {
+		_, err := e.Get(s)
 		return err == nil
 	})
 
-	env.Define("load", func(s string) interface{} {
+	e.Define("load", func(s string) interface{} {
 		body, err := ioutil.ReadFile(s)
 		if err != nil {
 			panic(err)
@@ -92,23 +88,18 @@ func Import(env *vm.Env) *vm.Env {
 			}
 			panic(err)
 		}
-		rv, err := vm.Run(stmts, env)
+		rv, err := vm.Run(e, nil, stmts)
 		if err != nil {
 			panic(err)
 		}
 		return rv
 	})
 
-	env.Define("panic", func(e interface{}) {
-		os.Setenv("ANKO_DEBUG", "1")
-		panic(e)
-	})
+	e.Define("print", fmt.Print)
+	e.Define("println", fmt.Println)
+	e.Define("printf", fmt.Printf)
 
-	env.Define("print", fmt.Print)
-	env.Define("println", fmt.Println)
-	env.Define("printf", fmt.Printf)
+	ImportToX(e)
 
-	ImportToX(env)
-
-	return env
+	return e
 }

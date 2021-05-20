@@ -24,6 +24,7 @@ import (
 %type<expr> expr
 %type<expr_idents> expr_idents
 %type<type_data> type_data
+%type<type_data_struct> type_data_struct
 %type<slice_count> slice_count
 %type<expr_member_or_ident> expr_member_or_ident
 %type<expr_member> expr_member
@@ -31,6 +32,7 @@ import (
 %type<expr_literals> expr_literals
 %type<expr_map> expr_map
 %type<expr_slice> expr_slice
+%type<expr_chan> expr_chan
 %type<expr> expr_unary
 %type<expr> expr_binary
 %type<expr> expr_lets
@@ -60,6 +62,7 @@ import (
 	expr                   ast.Expr
 	expr_idents            []string
 	type_data              *ast.TypeStruct
+	type_data_struct       *ast.TypeStruct
 	slice_count            int
 	expr_member_or_ident   ast.Expr
 	expr_member            *ast.MemberExpr
@@ -67,6 +70,7 @@ import (
 	expr_literals          ast.Expr
 	expr_map               *ast.MapExpr
 	expr_slice             ast.Expr
+	expr_chan              ast.Expr
 	expr_unary             ast.Expr
 	expr_binary            ast.Expr
 	expr_lets              ast.Expr
@@ -77,11 +81,11 @@ import (
 	op_multiply            ast.Operator
 }
 
-%token<tok> IDENT NUMBER STRING ARRAY VARARG FUNC RETURN VAR THROW IF ELSE FOR IN EQEQ NEQ GE LE OROR ANDAND NEW TRUE FALSE NIL NILCOALESCE MODULE TRY CATCH FINALLY PLUSEQ MINUSEQ MULEQ DIVEQ ANDEQ OREQ BREAK CONTINUE PLUSPLUS MINUSMINUS SHIFTLEFT SHIFTRIGHT SWITCH CASE DEFAULT GO CHAN MAKE OPCHAN TYPE LEN DELETE CLOSE MAP
+%token<tok> IDENT NUMBER STRING ARRAY VARARG FUNC RETURN VAR THROW IF ELSE FOR IN EQEQ NEQ GE LE OROR ANDAND NEW TRUE FALSE NIL NILCOALESCE MODULE TRY CATCH FINALLY PLUSEQ MINUSEQ MULEQ DIVEQ ANDEQ OREQ BREAK CONTINUE PLUSPLUS MINUSMINUS SHIFTLEFT SHIFTRIGHT SWITCH CASE DEFAULT GO CHAN STRUCT MAKE OPCHAN EQOPCHAN TYPE LEN DELETE CLOSE MAP IMPORT
 
 /* lowest precedence */
 %left ,
-%right '=' PLUSEQ MINUSEQ MULEQ DIVEQ ANDEQ OREQ
+%right '=' PLUSEQ MINUSEQ MULEQ DIVEQ ANDEQ OREQ EQOPCHAN
 %right ':'
 %right OPCHAN
 %right '?' NILCOALESCE
@@ -274,6 +278,23 @@ stmt_lets :
 			}
 		} else {
 			$$ = &ast.LetsStmt{LHSS: $1, RHSS: $3}
+		}
+	}
+	| expr EQOPCHAN expr
+	{
+		$$ = &ast.ChanStmt{LHS: $1, RHS: $3}
+		$$.SetPosition($1.Position())
+	}
+	| exprs EQOPCHAN expr
+	{
+		if len($1) == 2 {
+			chanStmt := &ast.ChanStmt{LHS: $1[0].(ast.Expr), OkExpr: $1[1].(ast.Expr), RHS: $3}
+			$$ = chanStmt
+			$$.SetPosition(chanStmt.LHS.Position())
+		} else if len($1) < 2 {
+			yylex.Error("missing expressions on left side of channel operator")
+			$$ = &ast.ChanStmt{RHS: $3}
+			$$.SetPosition($2.Position())
 		}
 	}
 
@@ -534,6 +555,11 @@ expr :
 		$$ = &ast.LenExpr{Expr: $3}
 		$$.SetPosition($1.Position())
 	}
+	| IMPORT '(' expr ')'
+	{
+		$$ = &ast.ImportExpr{Name: $3}
+		$$.SetPosition($1.Position())
+	}
 	| NEW '(' type_data ')'
 	{
 		if $3.Kind == ast.TypeDefault {
@@ -564,19 +590,15 @@ expr :
 		$$ = &ast.MakeTypeExpr{Name: $4.Lit, Type: $6}
 		$$.SetPosition($1.Position())
 	}
-	| expr OPCHAN expr
-	{
-		$$ = &ast.ChanExpr{LHS: $1, RHS: $3}
-		$$.SetPosition($1.Position())
-	}
-	| OPCHAN expr
-	{
-		$$ = &ast.ChanExpr{RHS: $2}
-		$$.SetPosition($2.Position())
-	}
 	| expr IN expr
 	{
 		$$ = &ast.IncludeExpr{ItemExpr: $1, ListExpr: $3}
+		$$.SetPosition($1.Position())
+	}
+	| MAP '{' opt_newlines expr_map opt_comma_newlines '}'
+	{
+		$4.TypeData = &ast.TypeStruct{Kind: ast.TypeMap, Key: &ast.TypeStruct{Name: "interface"}, SubType: &ast.TypeStruct{Name: "interface"}}
+		$$ = $4
 		$$.SetPosition($1.Position())
 	}
 	| MAP '[' type_data ']' type_data '{' opt_newlines expr_map opt_comma_newlines '}'
@@ -591,6 +613,11 @@ expr :
 		$$.SetPosition($3.Position())
 	}
 	| expr_slice
+	{
+		$$ = $1
+		$$.SetPosition($1.Position())
+	}
+	| expr_chan
 	{
 		$$ = $1
 		$$.SetPosition($1.Position())
@@ -623,7 +650,7 @@ type_data :
 	| type_data '.' IDENT
 	{
 		if $1.Kind != ast.TypeDefault {
-			yylex.Error("blah1")
+			yylex.Error("not type default")
 		} else {
 			$1.Env = append($1.Env, $1.Name)
 			$1.Name = $3.Lit
@@ -661,7 +688,24 @@ type_data :
 			$$ = &ast.TypeStruct{Kind: ast.TypeChan, SubType: $2}
 		}
 	}
+	| STRUCT '{' opt_newlines type_data_struct opt_newlines '}'
+	{
+		$$ = $4
+	}
 
+type_data_struct :
+	IDENT type_data
+	{
+		$$ = &ast.TypeStruct{Kind: ast.TypeStructType, StructNames: []string{$1.Lit}, StructTypes: []*ast.TypeStruct{$2}}
+	}
+	| type_data_struct ',' opt_newlines IDENT type_data
+	{
+		if $1 == nil {
+			yylex.Error("syntax error: unexpected ','")
+		}
+		$$.StructNames = append($$.StructNames, $4.Lit)
+		$$.StructTypes = append($$.StructTypes, $5)
+	}
 
 slice_count :
 	'[' ']'
@@ -795,6 +839,16 @@ expr_slice :
 	| expr '[' expr ':' expr ':' expr ']'
 	{
 		$$ = &ast.SliceExpr{Item: $1, Begin: $3, End: $5, Cap: $7}
+	}
+
+expr_chan :
+	expr OPCHAN expr
+	{
+		$$ = &ast.ChanExpr{LHS: $1, RHS: $3}
+	}
+	| OPCHAN expr
+	{
+		$$ = &ast.ChanExpr{RHS: $2}
 	}
 
 expr_unary :
@@ -1008,7 +1062,7 @@ op_binary :
 
 
 opt_term :
-
+	/* nothing */
 	| term
 	
 term :

@@ -65,12 +65,14 @@ var opName = map[string]int{
 	"default":  DEFAULT,
 	"go":       GO,
 	"chan":     CHAN,
+	"struct":   STRUCT,
 	"make":     MAKE,
 	"type":     TYPE,
 	"len":      LEN,
 	"delete":   DELETE,
 	"close":    CLOSE,
 	"map":      MAP,
+	"import":   IMPORT,
 }
 
 var (
@@ -151,6 +153,17 @@ retry:
 			case '=':
 				tok = EQEQ
 				lit = "=="
+			case ' ':
+				if s.peekPlus(1) == '<' && s.peekPlus(2) == '-' {
+					s.next()
+					s.next()
+					tok = EQOPCHAN
+					lit = "= <-"
+				} else {
+					s.back()
+					tok = int(ch)
+					lit = string(ch)
+				}
 			default:
 				s.back()
 				tok = int(ch)
@@ -355,6 +368,14 @@ func (s *Scanner) peek() rune {
 		return EOF
 	}
 	return s.src[s.offset]
+}
+
+// peek returns current rune plus i in the code.
+func (s *Scanner) peekPlus(i int) rune {
+	if len(s.src) <= s.offset+i {
+		return EOF
+	}
+	return s.src[s.offset+i]
 }
 
 // next moves offset to next.
@@ -576,6 +597,11 @@ func Parse(s *Scanner) (ast.Stmt, error) {
 // EnableErrorVerbose enabled verbose errors from the parser
 func EnableErrorVerbose() {
 	yyErrorVerbose = true
+}
+
+// EnableDebug enabled debug from the parser
+func EnableDebug(level int) {
+	yyDebug = level
 }
 
 // ParseSrc provides way to parse the code from source.

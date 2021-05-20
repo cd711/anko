@@ -1,11 +1,10 @@
 package vm
 
 import (
-	"fmt"
-	"os"
 	"reflect"
 
 	"github.com/mattn/anko/ast"
+	"github.com/mattn/anko/env"
 )
 
 // invokeExpr evaluates one expression.
@@ -19,7 +18,7 @@ func (runInfo *runInfoStruct) invokeExpr() {
 
 	// IdentExpr
 	case *ast.IdentExpr:
-		runInfo.rv, runInfo.err = runInfo.env.get(expr.Lit)
+		runInfo.rv, runInfo.err = runInfo.env.GetValue(expr.Lit)
 		if runInfo.err != nil {
 			runInfo.err = newError(expr, runInfo.err)
 		}
@@ -233,8 +232,8 @@ func (runInfo *runInfoStruct) invokeExpr() {
 			runInfo.rv = runInfo.rv.Elem()
 		}
 
-		if env, ok := runInfo.rv.Interface().(*Env); ok {
-			runInfo.rv, runInfo.err = env.get(expr.Name)
+		if env, ok := runInfo.rv.Interface().(*env.Env); ok {
+			runInfo.rv, runInfo.err = env.GetValue(expr.Name)
 			if runInfo.err != nil {
 				runInfo.err = newError(expr, runInfo.err)
 				runInfo.rv = nilValue
@@ -497,6 +496,49 @@ func (runInfo *runInfoStruct) invokeExpr() {
 			runInfo.rv = nilValue
 		}
 
+	// ImportExpr
+	case *ast.ImportExpr:
+		runInfo.expr = expr.Name
+		runInfo.invokeExpr()
+		if runInfo.err != nil {
+			return
+		}
+		runInfo.rv, runInfo.err = convertReflectValueToType(runInfo.rv, stringType)
+		if runInfo.err != nil {
+			runInfo.rv = nilValue
+			return
+		}
+		name := runInfo.rv.String()
+		runInfo.rv = nilValue
+
+		methods, ok := env.Packages[name]
+		if !ok {
+			runInfo.err = newStringError(expr, "package not found: "+name)
+			return
+		}
+		var err error
+		pack := runInfo.env.NewEnv()
+		for methodName, methodValue := range methods {
+			err = pack.DefineValue(methodName, methodValue)
+			if err != nil {
+				runInfo.err = newStringError(expr, "import DefineValue error: "+err.Error())
+				return
+			}
+		}
+
+		types, ok := env.PackageTypes[name]
+		if ok {
+			for typeName, typeValue := range types {
+				err = pack.DefineReflectType(typeName, typeValue)
+				if err != nil {
+					runInfo.err = newStringError(expr, "import DefineReflectType error: "+err.Error())
+					return
+				}
+			}
+		}
+
+		runInfo.rv = reflect.ValueOf(pack)
+
 	// MakeExpr
 	case *ast.MakeExpr:
 		t := makeType(runInfo, expr.TypeData)
@@ -576,31 +618,43 @@ func (runInfo *runInfoStruct) invokeExpr() {
 		if runInfo.rv.Kind() == reflect.Interface && !runInfo.rv.IsNil() {
 			runInfo.rv = runInfo.rv.Elem()
 		}
+
+		var lhs reflect.Value
 		rhs := runInfo.rv
 
-		if expr.LHS != nil {
-			runInfo.expr = expr.LHS
-			runInfo.invokeExpr()
-			if runInfo.err != nil {
-				if len(runInfo.err.Error()) < 18 || runInfo.err.Error()[:17] != "undefined symbol " {
-					return
-				}
-				runInfo.err = nil
-			}
-		}
-
-		if runInfo.rv.Kind() == reflect.Interface && !runInfo.rv.IsNil() {
-			runInfo.rv = runInfo.rv.Elem()
-		}
-
-		if expr.LHS == nil || runInfo.rv.Kind() != reflect.Chan {
-			// lhs is not channel
+		if expr.LHS == nil {
+			// lhs is nil
 			if rhs.Kind() != reflect.Chan {
 				// rhs is not channel
-				runInfo.err = newStringError(expr, "invalid operation for chan")
+				runInfo.err = newStringError(expr, "receive from non-chan type "+rhs.Kind().String())
 				runInfo.rv = nilValue
 				return
 			}
+		} else {
+			// lhs is not nil
+			runInfo.expr = expr.LHS
+			runInfo.invokeExpr()
+			if runInfo.err != nil {
+				return
+			}
+			if runInfo.rv.Kind() == reflect.Interface && !runInfo.rv.IsNil() {
+				runInfo.rv = runInfo.rv.Elem()
+			}
+			if runInfo.rv.Kind() != reflect.Chan {
+				// lhs is not channel
+				// lhs <- chan rhs or lhs <- rhs
+				runInfo.err = newStringError(expr, "send to non-chan type "+runInfo.rv.Kind().String())
+				runInfo.rv = nilValue
+				return
+			}
+			lhs = runInfo.rv
+		}
+
+		var chosen int
+		var ok bool
+
+		if rhs.Kind() == reflect.Chan {
+			// rhs is channel
 			// receive from rhs channel
 			cases := []reflect.SelectCase{{
 				Dir:  reflect.SelectRecv,
@@ -609,8 +663,6 @@ func (runInfo *runInfoStruct) invokeExpr() {
 				Dir:  reflect.SelectRecv,
 				Chan: rhs,
 			}}
-			var chosen int
-			var ok bool
 			chosen, runInfo.rv, ok = reflect.Select(cases)
 			if chosen == 0 {
 				runInfo.err = ErrInterrupt
@@ -619,42 +671,41 @@ func (runInfo *runInfoStruct) invokeExpr() {
 			}
 			if !ok {
 				runInfo.rv = nilValue
+				return
 			}
-			if expr.LHS != nil {
-				// TOFIX: this runs the expr.LHS again, will sometimes cause bugs, for example with i++
-				// most likely need a syntax change to expr = <- expr for let expr
-				// TODO: add option to return ok
-				runInfo.expr = expr.LHS
-				runInfo.invokeLetExpr()
-			}
+			rhs = runInfo.rv
+		}
+
+		if expr.LHS == nil {
+			// <- chan rhs is receive
 			return
 		}
 
-		// send to lhs channel
-		rhs, runInfo.err = convertReflectValueToType(rhs, runInfo.rv.Type().Elem())
+		// chan lhs <- chan rhs is receive & send
+		// or
+		// chan lhs <- rhs is send
+
+		runInfo.rv = nilValue
+		rhs, runInfo.err = convertReflectValueToType(rhs, lhs.Type().Elem())
 		if runInfo.err != nil {
-			runInfo.err = newStringError(expr, "cannot use type "+rhs.Type().String()+" as type "+runInfo.rv.Type().Elem().String()+" to send to chan")
-			runInfo.rv = nilValue
+			runInfo.err = newStringError(expr, "cannot use type "+rhs.Type().String()+" as type "+lhs.Type().Elem().String()+" to send to chan")
 			return
 		}
+		// send rhs to lhs channel
 		cases := []reflect.SelectCase{{
 			Dir:  reflect.SelectRecv,
 			Chan: reflect.ValueOf(runInfo.ctx.Done()),
 		}, {
 			Dir:  reflect.SelectSend,
-			Chan: runInfo.rv,
+			Chan: lhs,
 			Send: rhs,
 		}}
-		// capture panics if not in debug mode
-		defer func() {
-			if os.Getenv("ANKO_DEBUG") == "" {
-				if recoverResult := recover(); recoverResult != nil {
-					runInfo.err = fmt.Errorf("%v", recoverResult)
-				}
-			}
-		}()
-		runInfo.rv = nilValue
-		if chosen, _, _ := reflect.Select(cases); chosen == 0 {
+		if !runInfo.options.Debug {
+			// captures panic
+			defer recoverFunc(runInfo)
+		}
+		chosen, _, _ = reflect.Select(cases)
+		if chosen == 0 {
 			runInfo.err = ErrInterrupt
 		}
 

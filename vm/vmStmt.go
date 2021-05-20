@@ -6,16 +6,41 @@ import (
 	"reflect"
 
 	"github.com/mattn/anko/ast"
+	"github.com/mattn/anko/env"
+	"github.com/mattn/anko/parser"
 )
 
+// Execute parses script and executes in the specified environment.
+func Execute(env *env.Env, options *Options, script string) (interface{}, error) {
+	stmt, err := parser.ParseSrc(script)
+	if err != nil {
+		return nilValue, err
+	}
+
+	return RunContext(context.Background(), env, options, stmt)
+}
+
+// ExecuteContext parses script and executes in the specified environment with context.
+func ExecuteContext(ctx context.Context, env *env.Env, options *Options, script string) (interface{}, error) {
+	stmt, err := parser.ParseSrc(script)
+	if err != nil {
+		return nilValue, err
+	}
+
+	return RunContext(ctx, env, options, stmt)
+}
+
 // Run executes statement in the specified environment.
-func Run(stmt ast.Stmt, env *Env) (interface{}, error) {
-	return RunContext(context.Background(), stmt, env)
+func Run(env *env.Env, options *Options, stmt ast.Stmt) (interface{}, error) {
+	return RunContext(context.Background(), env, options, stmt)
 }
 
 // RunContext executes statement in the specified environment with context.
-func RunContext(ctx context.Context, stmt ast.Stmt, env *Env) (interface{}, error) {
-	runInfo := runInfoStruct{ctx: ctx, env: env, stmt: stmt, rv: nilValue}
+func RunContext(ctx context.Context, env *env.Env, options *Options, stmt ast.Stmt) (interface{}, error) {
+	runInfo := runInfoStruct{ctx: ctx, env: env, options: options, stmt: stmt, rv: nilValue}
+	if runInfo.options == nil {
+		runInfo.options = &Options{}
+	}
 	runInfo.runSingleStmt()
 	if runInfo.err == ErrReturn {
 		runInfo.err = nil
@@ -80,7 +105,11 @@ func (runInfo *runInfoStruct) runSingleStmt() {
 			if runInfo.err != nil {
 				return
 			}
-			rvs[i] = runInfo.rv
+			if env, ok := runInfo.rv.Interface().(*env.Env); ok {
+				rvs[i] = reflect.ValueOf(env.DeepCopy())
+			} else {
+				rvs[i] = runInfo.rv
+			}
 		}
 
 		if len(rvs) == 1 && len(stmt.Names) > 1 {
@@ -92,7 +121,7 @@ func (runInfo *runInfoStruct) runSingleStmt() {
 			if (value.Kind() == reflect.Slice || value.Kind() == reflect.Array) && value.Len() > 0 {
 				// value is slice/array, add each value to left side names
 				for i := 0; i < value.Len() && i < len(stmt.Names); i++ {
-					runInfo.env.defineValue(stmt.Names[i], value.Index(i))
+					runInfo.env.DefineValue(stmt.Names[i], value.Index(i))
 				}
 				// return last value of slice/array
 				runInfo.rv = value.Index(value.Len() - 1)
@@ -101,8 +130,8 @@ func (runInfo *runInfoStruct) runSingleStmt() {
 		}
 
 		// define all names with right side values
-		for i := 0; i < len(rvs) && i < len(stmt.Names); i++ {
-			runInfo.env.defineValue(stmt.Names[i], rvs[i])
+		for i = 0; i < len(rvs) && i < len(stmt.Names); i++ {
+			runInfo.env.DefineValue(stmt.Names[i], rvs[i])
 		}
 
 		// return last right side value
@@ -112,13 +141,17 @@ func (runInfo *runInfoStruct) runSingleStmt() {
 	case *ast.LetsStmt:
 		// get right side expression values
 		rvs := make([]reflect.Value, len(stmt.RHSS))
-		for i, rhs := range stmt.RHSS {
-			runInfo.expr = rhs
+		var i int
+		for i, runInfo.expr = range stmt.RHSS {
 			runInfo.invokeExpr()
 			if runInfo.err != nil {
 				return
 			}
-			rvs[i] = runInfo.rv
+			if env, ok := runInfo.rv.Interface().(*env.Env); ok {
+				rvs[i] = reflect.ValueOf(env.DeepCopy())
+			} else {
+				rvs[i] = runInfo.rv
+			}
 		}
 
 		if len(rvs) == 1 && len(stmt.LHSS) > 1 {
@@ -144,7 +177,7 @@ func (runInfo *runInfoStruct) runSingleStmt() {
 		}
 
 		// invoke all left side expressions with right side values
-		for i := 0; i < len(rvs) && i < len(stmt.LHSS); i++ {
+		for i = 0; i < len(rvs) && i < len(stmt.LHSS); i++ {
 			value := rvs[i]
 			if value.Kind() == reflect.Interface && !value.IsNil() {
 				value = value.Elem()
@@ -262,7 +295,7 @@ func (runInfo *runInfoStruct) runSingleStmt() {
 			// Catch
 			runInfo.stmt = stmt.Catch
 			if stmt.Var != "" {
-				runInfo.env.defineValue(stmt.Var, reflect.ValueOf(runInfo.err))
+				runInfo.env.DefineValue(stmt.Var, reflect.ValueOf(runInfo.err))
 			}
 			runInfo.err = nil
 			runInfo.runSingleStmt()
@@ -361,7 +394,7 @@ func (runInfo *runInfoStruct) runSingleStmt() {
 				if iv.Kind() == reflect.Ptr {
 					iv = iv.Elem()
 				}
-				runInfo.env.defineValue(stmt.Vars[0], iv)
+				runInfo.env.DefineValue(stmt.Vars[0], iv)
 
 				runInfo.stmt = stmt.Stmt
 				runInfo.runSingleStmt()
@@ -395,10 +428,10 @@ func (runInfo *runInfoStruct) runSingleStmt() {
 				default:
 				}
 
-				runInfo.env.defineValue(stmt.Vars[0], keys[i])
+				runInfo.env.DefineValue(stmt.Vars[0], keys[i])
 
 				if len(stmt.Vars) > 1 {
-					runInfo.env.defineValue(stmt.Vars[1], value.MapIndex(keys[i]))
+					runInfo.env.DefineValue(stmt.Vars[1], value.MapIndex(keys[i]))
 				}
 
 				runInfo.stmt = stmt.Stmt
@@ -449,7 +482,7 @@ func (runInfo *runInfoStruct) runSingleStmt() {
 					runInfo.rv = runInfo.rv.Elem()
 				}
 
-				runInfo.env.defineValue(stmt.Vars[0], runInfo.rv)
+				runInfo.env.DefineValue(stmt.Vars[0], runInfo.rv)
 
 				runInfo.stmt = stmt.Stmt
 				runInfo.runSingleStmt()
@@ -572,20 +605,18 @@ func (runInfo *runInfoStruct) runSingleStmt() {
 
 	// ModuleStmt
 	case *ast.ModuleStmt:
-		env := runInfo.env
-		runInfo.env = env.NewEnv()
-		runInfo.env.SetName(stmt.Name)
-
-		runInfo.stmt = stmt.Stmt
-		runInfo.runSingleStmt()
+		e := runInfo.env
+		runInfo.env, runInfo.err = e.NewModule(stmt.Name)
 		if runInfo.err != nil {
-			runInfo.env = env
 			return
 		}
-
-		env.defineGlobalValue(stmt.Name, reflect.ValueOf(runInfo.env))
+		runInfo.stmt = stmt.Stmt
+		runInfo.runSingleStmt()
+		runInfo.env = e
+		if runInfo.err != nil {
+			return
+		}
 		runInfo.rv = nilValue
-		runInfo.env = env
 
 	// SwitchStmt
 	case *ast.SwitchStmt:
@@ -659,7 +690,7 @@ func (runInfo *runInfoStruct) runSingleStmt() {
 				runInfo.rv = nilValue
 				return
 			}
-			runInfo.err = runInfo.env.Delete(item.String())
+			runInfo.env.Delete(item.String())
 			runInfo.rv = nilValue
 
 		case reflect.Map:
@@ -699,6 +730,69 @@ func (runInfo *runInfoStruct) runSingleStmt() {
 		}
 		runInfo.err = newStringError(stmt, "type cannot be "+runInfo.rv.Kind().String()+" for close")
 		runInfo.rv = nilValue
+
+	// ChanStmt
+	case *ast.ChanStmt:
+		runInfo.expr = stmt.RHS
+		runInfo.invokeExpr()
+		if runInfo.err != nil {
+			return
+		}
+		if runInfo.rv.Kind() == reflect.Interface && !runInfo.rv.IsNil() {
+			runInfo.rv = runInfo.rv.Elem()
+		}
+
+		if runInfo.rv.Kind() != reflect.Chan {
+			// rhs is not channel
+			runInfo.err = newStringError(stmt, "receive from non-chan type "+runInfo.rv.Kind().String())
+			runInfo.rv = nilValue
+			return
+		}
+
+		// rhs is channel
+		// receive from rhs channel
+		rhs := runInfo.rv
+		cases := []reflect.SelectCase{{
+			Dir:  reflect.SelectRecv,
+			Chan: reflect.ValueOf(runInfo.ctx.Done()),
+		}, {
+			Dir:  reflect.SelectRecv,
+			Chan: rhs,
+		}}
+		var chosen int
+		var ok bool
+		chosen, runInfo.rv, ok = reflect.Select(cases)
+		if chosen == 0 {
+			runInfo.err = ErrInterrupt
+			runInfo.rv = nilValue
+			return
+		}
+
+		rhs = runInfo.rv // store rv in rhs temporarily
+
+		if stmt.OkExpr != nil {
+			// set ok to OkExpr
+			if ok {
+				runInfo.rv = trueValue
+			} else {
+				runInfo.rv = falseValue
+			}
+			runInfo.expr = stmt.OkExpr
+			runInfo.invokeLetExpr()
+			// TODO: ok to ignore error?
+		}
+
+		if ok {
+			// set rv to lhs
+			runInfo.rv = rhs
+			runInfo.expr = stmt.LHS
+			runInfo.invokeLetExpr()
+			if runInfo.err != nil {
+				return
+			}
+		} else {
+			runInfo.rv = nilValue
+		}
 
 	// default
 	default:
